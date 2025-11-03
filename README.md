@@ -28,7 +28,7 @@ Arxiv 2025
 
 
 ## Updates
-- [ ] Release Bench2Drive,DriveLM,NAVSIM2.0,Drivebench evaluation frameworks  
+- [x] Release Bench2Drive,DriveLM,NAVSIM2.0,Drivebench evaluation frameworks  
 - [√] Release Paper  
 - [√] Release Full Models and Training/Evaluation Framework   
 - [√] Release Full Driving QA Datasets

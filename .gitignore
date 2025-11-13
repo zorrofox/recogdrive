@@ -1,2 +1,4 @@
 venv/
 *.pyc
+models/
+tests/work_dirs/

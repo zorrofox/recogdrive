@@ -5,7 +5,11 @@
 # --------------------------------------------------------
 
 import torch
-from flash_attn.flash_attn_interface import flash_attn_varlen_func
+try:
+    from flash_attn.flash_attn_interface import flash_attn_varlen_func
+except ImportError:
+    flash_attn_varlen_func = None
+
 from transformers.models.qwen2.modeling_qwen2 import (QWEN2_ATTENTION_CLASSES,
                                                       Qwen2FlashAttention2)
 

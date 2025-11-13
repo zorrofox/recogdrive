@@ -5,7 +5,11 @@
 # --------------------------------------------------------
 
 import torch
-from flash_attn.flash_attn_interface import flash_attn_varlen_func
+try:
+    from flash_attn.flash_attn_interface import flash_attn_varlen_func
+except ImportError:
+    flash_attn_varlen_func = None
+
 from internvl.model.internlm2.modeling_internlm2 import (
     INTERNLM2_ATTENTION_CLASSES, InternLM2FlashAttention2,
     apply_rotary_pos_emb)

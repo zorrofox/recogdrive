@@ -5,7 +5,11 @@
 # --------------------------------------------------------
 
 import torch
-from flash_attn.flash_attn_interface import flash_attn_varlen_func
+try:
+    from flash_attn.flash_attn_interface import flash_attn_varlen_func
+except ImportError:
+    flash_attn_varlen_func = None
+
 from internvl.model.phi3.modeling_phi3 import (PHI3_ATTENTION_CLASSES,
                                                Phi3FlashAttention2)
 

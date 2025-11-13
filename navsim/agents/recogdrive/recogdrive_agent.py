@@ -80,7 +80,7 @@ class ReCogDriveAgent(AbstractAgent):
             cfg.grpo_cfg.metric_cache_path = self.metric_cache_path
             cfg.grpo_cfg.reference_policy_checkpoint = self.reference_policy_checkpoint
             
-        self.action_head = ReCogDriveDiffusionPlanner(cfg).cuda()
+        self.action_head = ReCogDriveDiffusionPlanner(cfg)
         self.num_inference_samples = 1
         self.inference_selection_mode = "median"
 
@@ -113,21 +113,22 @@ class ReCogDriveAgent(AbstractAgent):
         )]
 
     def forward(self, features: Dict[str, torch.Tensor], targets=None, tokens_list=None) -> Dict[str, torch.Tensor]:
+        device = next(self.parameters()).device
         for key, tensor in features.items():
             if isinstance(tensor, torch.Tensor):
-                features[key] = tensor.cuda()
+                features[key] = tensor.to(device)
 
         model_dtype = next(self.action_head.parameters()).dtype
 
-        history_trajectory = features["history_trajectory"].cuda()
-        high_command_one_hot = features["high_command_one_hot"].cuda()
+        history_trajectory = features["history_trajectory"].to(device)
+        high_command_one_hot = features["high_command_one_hot"].to(device)
         
         
         if history_trajectory.ndim == 2: history_trajectory = history_trajectory.unsqueeze(0)
         if high_command_one_hot.ndim == 1: high_command_one_hot = high_command_one_hot.unsqueeze(0)
 
         if self.cache_hidden_state:
-            last_hidden_state = features["last_hidden_state"].cuda()
+            last_hidden_state = features["last_hidden_state"].to(device)
         else:
             if self.backbone is None:
                 raise RuntimeError("Agent is in 'no-cache' mode, but backbone is not initialized.")
@@ -138,7 +139,7 @@ class ReCogDriveAgent(AbstractAgent):
             pixel_values_list = [load_image(path) for path in image_paths]
             
             num_patches_list = [p.shape[0] for p in pixel_values_list]
-            pixel_values_cat = torch.cat(pixel_values_list, dim=0).cuda()
+            pixel_values_cat = torch.cat(pixel_values_list, dim=0).to(device)
             
 
             navigation_commands = ['turn left', 'go straight', 'turn right']
@@ -175,7 +176,7 @@ class ReCogDriveAgent(AbstractAgent):
             outputs = self.backbone(pixel_values_cat, questions, num_patches_list=num_patches_list)
             last_hidden_state = outputs.hidden_states[-1]
 
-        status_feature = features["status_feature"].cuda()
+        status_feature = features["status_feature"].to(device)
         if status_feature.ndim == 1: status_feature = status_feature.unsqueeze(0)
         if last_hidden_state.ndim == 2: last_hidden_state = last_hidden_state.unsqueeze(0)
 

@@ -1,0 +1,5 @@
+{"conversations": [{"from": "human", "value": "<image>\nWhat is this?"}, {"from": "gpt", "value": "It is a red square."}], "image": "tests/dummy_data/test.jpg"}
+{"conversations": [{"from": "human", "value": "<image>\nWhat is this?"}, {"from": "gpt", "value": "It is a red square."}], "image": "tests/dummy_data/test.jpg"}
+{"conversations": [{"from": "human", "value": "<image>\nWhat is this?"}, {"from": "gpt", "value": "It is a red square."}], "image": "tests/dummy_data/test.jpg"}
+{"conversations": [{"from": "human", "value": "<image>\nWhat is this?"}, {"from": "gpt", "value": "It is a red square."}], "image": "tests/dummy_data/test.jpg"}
+{"conversations": [{"from": "human", "value": "<image>\nWhat is this?"}, {"from": "gpt", "value": "It is a red square."}], "image": "tests/dummy_data/test.jpg"}

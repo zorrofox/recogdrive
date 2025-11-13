@@ -1,0 +1,1 @@
+{"dummy_dataset": {"root": "tests/dummy_data", "annotation": "tests/dummy_data/annotation.jsonl", "data_augment": false, "repeat_time": 1, "length": 5}}

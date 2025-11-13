@@ -950,7 +950,7 @@ def main():
     params = {k: v.detach() for k, v in model.named_parameters()}
     
     # Convert to JAX params for optax
-    jax_params = jax.tree_map(lambda x: x.jax(), params)
+    jax_params = jax.tree_util.tree_map(lambda x: x.jax(), params)
     
     # Initialize optimizer with JAX params
     opt_state = optimizer.init(jax_params)
@@ -961,7 +961,7 @@ def main():
             # params are JAX arrays/tracers here. Wrap them for torchax.
             env = torchax.default_env()
             # We assume params structure matches model params structure
-            torch_params = jax.tree_map(lambda x: torchax_tensor.Tensor(x, env), params)
+            torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), params)
             
             # Functional call to model
             outputs = torch.func.functional_call(model, torch_params, batch)
@@ -1006,7 +1006,7 @@ def main():
                 
                 # Wrap back to torchax tensors for saving
                 env = torchax.default_env()
-                current_torch_params = jax.tree_map(lambda x: torchax_tensor.Tensor(x, env), jax_params)
+                current_torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), jax_params)
                 
                 state = {
                     'params': current_torch_params,
@@ -1022,7 +1022,7 @@ def main():
     
     # Wrap back to torchax tensors for saving
     env = torchax.default_env()
-    final_torch_params = jax.tree_map(lambda x: torchax_tensor.Tensor(x, env), jax_params)
+    final_torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), jax_params)
     
     state = {
         'params': final_torch_params,

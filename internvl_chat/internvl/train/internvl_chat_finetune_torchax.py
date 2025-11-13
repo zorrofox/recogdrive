@@ -828,6 +828,9 @@ def main():
 
     training_args.use_packed_ds = data_args.use_packed_ds
 
+    # Ensure output_dir is absolute path for orbax checkpointing
+    training_args.output_dir = os.path.abspath(training_args.output_dir)
+
     # Setup logging
     logging.basicConfig(
         format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',

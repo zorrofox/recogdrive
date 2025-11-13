@@ -76,6 +76,7 @@ import jax
 import jax.numpy as jnp
 import optax
 from torchax.interop import JittableModule
+from torchax import tensor as torchax_tensor
 
 # Try to import petrel_client for image loading, fallback to PIL if unavailable
 try:
@@ -937,20 +938,32 @@ def main():
     # Optimizer
     learning_rate = training_args.learning_rate
     optimizer = optax.adamw(learning_rate, weight_decay=training_args.weight_decay)
-    # Detach parameters for optimizer init to avoid requires_grad issues in opt_state
-    opt_state = optimizer.init([p.detach() for p in model.parameters()])
+    
+    # Get initial params as torchax tensors
+    params = {k: v.detach() for k, v in model.named_parameters()}
+    
+    # Convert to JAX params for optax
+    jax_params = jax.tree_map(lambda x: x.jax(), params)
+    
+    # Initialize optimizer with JAX params
+    opt_state = optimizer.init(jax_params)
 
     # Training Step Function
-    def train_step(params, batch, opt_state):
+    def train_step(jax_params, batch, opt_state):
         def loss_fn(params, batch):
+            # params are JAX arrays/tracers here. Wrap them for torchax.
+            env = torchax.default_env()
+            # We assume params structure matches model params structure
+            torch_params = jax.tree_map(lambda x: torchax_tensor.Tensor(x, env), params)
+            
             # Functional call to model
-            outputs = torch.func.functional_call(model, params, batch)
+            outputs = torch.func.functional_call(model, torch_params, batch)
             return outputs.loss
 
-        loss, grads = jax.value_and_grad(loss_fn)(params, batch)
-        updates, opt_state = optimizer.update(grads, opt_state, params)
-        params = optax.apply_updates(params, updates)
-        return params, opt_state, loss
+        loss, grads = jax.value_and_grad(loss_fn)(jax_params, batch)
+        updates, opt_state = optimizer.update(grads, opt_state, jax_params)
+        new_jax_params = optax.apply_updates(jax_params, updates)
+        return new_jax_params, opt_state, loss
 
     # JIT compile the training step
     train_step_jit = jax.jit(train_step)
@@ -959,10 +972,6 @@ def main():
     logger.info("Starting training loop...")
     model.train()
     
-    # Get initial params as torchax tensors (which wrap jax arrays)
-    # We need to treat them as the state
-    params = {k: v.detach() for k, v in model.named_parameters()}
-    
     global_step = 0
     for epoch in range(int(training_args.num_train_epochs)):
         for batch in train_dataloader:
@@ -970,11 +979,7 @@ def main():
             batch = {k: v.to('jax') for k, v in batch.items() if isinstance(v, torch.Tensor)}
             
             # Perform training step
-            # Note: params here are torchax tensors, which should be compatible with jax.jit if torchax handles it
-            # However, torch.func.functional_call expects a dict of params.
-            # And optimizer.update expects params to match the structure of grads.
-            
-            params, opt_state, loss = train_step_jit(params, batch, opt_state)
+            jax_params, opt_state, loss = train_step_jit(jax_params, batch, opt_state)
             
             if global_step % training_args.logging_steps == 0:
                 logger.info(f"Epoch: {epoch}, Step: {global_step}, Loss: {loss}")
@@ -983,8 +988,13 @@ def main():
             
             if training_args.save_steps > 0 and global_step % training_args.save_steps == 0:
                 save_path = os.path.join(training_args.output_dir, f"checkpoint-{global_step}.pt")
+                
+                # Wrap back to torchax tensors for saving
+                env = torchax.default_env()
+                current_torch_params = jax.tree_map(lambda x: torchax_tensor.Tensor(x, env), jax_params)
+                
                 state = {
-                    'params': params,
+                    'params': current_torch_params,
                     'opt_state': opt_state,
                     'epoch': epoch,
                     'global_step': global_step
@@ -994,8 +1004,13 @@ def main():
 
     # Save final model
     final_save_path = os.path.join(training_args.output_dir, "final_checkpoint.pt")
+    
+    # Wrap back to torchax tensors for saving
+    env = torchax.default_env()
+    final_torch_params = jax.tree_map(lambda x: torchax_tensor.Tensor(x, env), jax_params)
+    
     state = {
-        'params': params,
+        'params': final_torch_params,
         'opt_state': opt_state,
         'epoch': training_args.num_train_epochs,
         'global_step': global_step

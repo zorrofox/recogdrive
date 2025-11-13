@@ -818,9 +818,6 @@ def len2weight(x, loss_reduction):
 
 
 def main():
-    # Enable torchax globally
-    torchax.enable_globally()
-
     # Parse input arguments
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith('.json'):
@@ -890,6 +887,9 @@ def main():
     else:
         # ... (omitted for brevity, similar changes needed if this path is taken)
         raise NotImplementedError("Only loading from model_name_or_path is supported for this migration script for now.")
+
+    # Enable torchax globally AFTER loading the model to avoid safetensors/storage issues
+    torchax.enable_globally()
 
     model.img_context_token_id = img_context_token_id
 

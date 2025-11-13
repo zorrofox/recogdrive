@@ -9,6 +9,7 @@ import math
 import os
 import random
 import sys
+import time
 import traceback
 import warnings
 from copy import deepcopy
@@ -894,6 +895,9 @@ def main():
 
     # Enable torchax globally AFTER loading the model to avoid safetensors/storage issues
     torchax.enable_globally()
+    
+    # VERIFY: Print available JAX devices
+    logger.info(f"JAX Devices: {jax.devices()}")
 
     model.img_context_token_id = img_context_token_id
 
@@ -978,14 +982,22 @@ def main():
     global_step = 0
     for epoch in range(int(training_args.num_train_epochs)):
         for batch in train_dataloader:
+            step_start_time = time.time()
+            
             # Move batch to JAX device
             batch = {k: v.to('jax') for k, v in batch.items() if isinstance(v, torch.Tensor)}
             
             # Perform training step
             jax_params, opt_state, loss = train_step_jit(jax_params, batch, opt_state)
             
+            # Block until loss is computed to measure actual execution time (JAX is async)
+            loss.block_until_ready()
+            
+            step_end_time = time.time()
+            step_duration = step_end_time - step_start_time
+            
             if global_step % training_args.logging_steps == 0:
-                logger.info(f"Epoch: {epoch}, Step: {global_step}, Loss: {loss}")
+                logger.info(f"Epoch: {epoch}, Step: {global_step}, Loss: {loss}, Time: {step_duration:.4f}s")
             
             global_step += 1
             

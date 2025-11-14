@@ -67,6 +67,49 @@ python internvl_chat/internvl/train/internvl_chat_finetune_torchax.py \
 
 *Note: DeepSpeed arguments are removed as `torchax`/JAX handles optimization.*
 
+### Verified TPU Command (Stage 1)
+
+The following command has been verified to run successfully on a TPU VM (e.g., v6e-4) using a Docker container:
+
+```bash
+gcloud alpha compute tpus tpu-vm ssh tpu-v6e-4 \
+   --project grhuang-02 \
+   --zone=us-east5-b \
+   --tunnel-through-iap \
+   --worker=0 \
+   --command='docker run \
+     --privileged \
+     --workdir /recogdrive \
+     -v $(pwd)/recogdrive:/recogdrive \
+     -e PYTHONPATH=/recogdrive/internvl_chat:$PYTHONPATH \
+     --rm --net=host \
+     us-east5-docker.pkg.dev/grhuang-02/xiaomi-tpu/recogdrive-tpu:latest \
+     python internvl_chat/internvl/train/internvl_chat_finetune_torchax.py \
+    --model_name_or_path "models/InternVL3-2B" \
+    --conv_style "internvl2_5" \
+    --output_dir "tests/work_dirs/test_stage1_tpu" \
+    --meta_path "tests/dummy_data/meta.json" \
+    --force_image_size 448 \
+    --max_dynamic_patch 4 \
+    --down_sample_ratio 0.5 \
+    --drop_path_rate 0.0 \
+    --bf16 True \
+    --num_train_epochs 1 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 1 \
+    --learning_rate 4e-5 \
+    --weight_decay 0.05 \
+    --warmup_ratio 0.0 \
+    --logging_steps 1 \
+    --max_seq_length 2048 \
+    --do_train True \
+    --grad_checkpoint False \
+    --group_by_length False \
+    --dynamic_image_size True \
+    --use_thumbnail True \
+    --ps_version v2'
+```
+
 ### Stage 2: Diffusion Planner Training
 
 Use the new `run_training_recogdrive_torchax.py` script.

@@ -939,7 +939,7 @@ def main():
         shuffle=True,
         collate_fn=collator,
         num_workers=training_args.dataloader_num_workers,
-        pin_memory=True
+        pin_memory=False
     )
 
     # Optimizer
@@ -962,9 +962,11 @@ def main():
             env = torchax.default_env()
             # We assume params structure matches model params structure
             torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), params)
+            # Wrap batch elements as torchax Tensors
+            torch_batch = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), batch)
             
             # Functional call to model
-            outputs = torch.func.functional_call(model, torch_params, batch)
+            outputs = torch.func.functional_call(model, torch_params, args=(), kwargs=torch_batch)
             return outputs.loss
 
         loss, grads = jax.value_and_grad(loss_fn)(jax_params, batch)
@@ -983,19 +985,30 @@ def main():
     for epoch in range(int(training_args.num_train_epochs)):
         for batch in train_dataloader:
             step_start_time = time.time()
-            
-            # Move batch to JAX device
-            batch = {k: v.to('jax') for k, v in batch.items() if isinstance(v, torch.Tensor)}
+
+            # Move batch to JAX device and unwrap to JAX arrays
+            new_batch = {}
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    # Cast to bfloat16 if bf16 training is enabled and tensor is float
+                    if training_args.bf16 and v.dtype == torch.float32:
+                        v = v.to(torch.bfloat16)
+                    new_batch[k] = v.to('jax').jax()
+            batch = new_batch
             
             # Perform training step
+            # Note: params here are torchax tensors, which should be compatible with jax.jit if torchax handles it
+            # However, torch.func.functional_call expects a dict of params.
+            # And optimizer.update expects params to match the structure of grads.
+            
             jax_params, opt_state, loss = train_step_jit(jax_params, batch, opt_state)
             
             # Block until loss is computed to measure actual execution time (JAX is async)
             loss.block_until_ready()
-            
+
             step_end_time = time.time()
             step_duration = step_end_time - step_start_time
-            
+
             if global_step % training_args.logging_steps == 0:
                 logger.info(f"Epoch: {epoch}, Step: {global_step}, Loss: {loss}, Time: {step_duration:.4f}s")
             

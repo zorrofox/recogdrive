@@ -78,6 +78,8 @@ import jax.numpy as jnp
 import optax
 from torchax.interop import JittableModule
 from torchax import tensor as torchax_tensor
+from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
+from jax.experimental import mesh_utils
 
 # Try to import petrel_client for image loading, fallback to PIL if unavailable
 try:
@@ -712,7 +714,7 @@ class LazySupervisedDataset(Dataset):
 
         if self.worker_id == 0:
             logger.info(
-                f'[{self.ds_name}] [Worker id {self.worker_id}] '
+                f'[{self.ds_name}] [Worker id {self.worker_id}] ' 
                 f'begin to iter with {start_idx=}'
             )
 
@@ -917,8 +919,8 @@ def main():
         model.language_model._set_gradient_checkpointing()
 
     # Move model to JAX device
-    logger.info("Moving model to JAX device...")
-    model = model.to('jax')
+    # logger.info("Moving model to JAX device...")
+    # model = model.to('jax')
 
     # Build dataset
     train_dataset = build_datasets(
@@ -942,40 +944,81 @@ def main():
         pin_memory=False
     )
 
+    # --- JAX Distributed Setup (FSDP) ---
+    num_devices = len(jax.devices())
+    mesh = Mesh(mesh_utils.create_device_mesh((num_devices,)), axis_names=('data',))
+    
+    # Sharding Spec: Shard the first dimension (0) of all arrays if divisible by num_devices
+    # This acts as FSDP (sharding parameters) and Data Parallelism (sharding batch)
+    def get_sharding(x):
+        if hasattr(x, 'shape') and len(x.shape) > 0 and x.shape[0] % num_devices == 0:
+            return NamedSharding(mesh, P('data'))
+        else:
+            return NamedSharding(mesh, P()) # Replicated
+
+    # Helper to put PyTree to sharded device memory
+    def to_sharded(pytree):
+        return jax.tree_util.tree_map(lambda x: jax.device_put(x, get_sharding(x)), pytree)
+
     # Optimizer
     learning_rate = training_args.learning_rate
     optimizer = optax.adamw(learning_rate, weight_decay=training_args.weight_decay)
     
-    # Get initial params as torchax tensors
+    # Get initial params as torchax tensors (on CPU)
     params = {k: v.detach() for k, v in model.named_parameters()}
+    buffers = {k: v.detach() for k, v in model.named_buffers()}
+    params.update(buffers)
     
-    # Convert to JAX params for optax
-    jax_params = jax.tree_util.tree_map(lambda x: x.jax(), params)
+    # Convert to JAX params (on CPU)
+    def torch_to_jax(tensor):
+        is_bf16 = tensor.dtype == torch.bfloat16
+        if is_bf16:
+            tensor = tensor.float()
+        arr = jnp.array(tensor.detach().cpu().numpy())
+        if is_bf16:
+            arr = arr.astype(jnp.bfloat16)
+        return arr
+
+    jax_params_cpu = jax.tree_util.tree_map(torch_to_jax, params)
     
-    # Initialize optimizer with JAX params
-    opt_state = optimizer.init(jax_params)
+    # Move params to TPU with sharding
+    logger.info("Sharding parameters to TPU...")
+    jax_params = to_sharded(jax_params_cpu)
+    
+    # Initialize optimizer state on TPU (sharded)
+    # We need to define out_shardings for opt_state. 
+    # Since opt_state structure matches params, we can use jax.eval_shape to infer structure and apply sharding.
+    
+    opt_state_shape = jax.eval_shape(optimizer.init, jax_params)
+    opt_state_sharding = jax.tree_util.tree_map(get_sharding, opt_state_shape)
+    
+    @partial(jax.jit, out_shardings=opt_state_sharding)
+    def init_opt_state(p):
+        return optimizer.init(p)
+        
+    logger.info("Initializing optimizer state on TPU...")
+    opt_state = init_opt_state(jax_params)
 
     # Training Step Function
-    def train_step(jax_params, batch, opt_state):
+    # in_shardings: params (sharded), batch (sharded), opt_state (sharded)
+    # out_shardings: params (sharded), opt_state (sharded), loss (replicated)
+    
+    params_sharding = jax.tree_util.tree_map(get_sharding, jax_params)
+    
+    @partial(jax.jit, 
+             out_shardings=(params_sharding, opt_state_sharding, NamedSharding(mesh, P())))
+    def train_step_jit(jax_params, batch, opt_state):
         def loss_fn(params, batch):
-            # params are JAX arrays/tracers here. Wrap them for torchax.
             env = torchax.default_env()
-            # We assume params structure matches model params structure
             torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), params)
-            # Wrap batch elements as torchax Tensors
             torch_batch = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), batch)
-            
-            # Functional call to model
             outputs = torch.func.functional_call(model, torch_params, args=(), kwargs=torch_batch)
-            return outputs.loss
+            return outputs.loss.jax()
 
         loss, grads = jax.value_and_grad(loss_fn)(jax_params, batch)
         updates, opt_state = optimizer.update(grads, opt_state, jax_params)
         new_jax_params = optax.apply_updates(jax_params, updates)
         return new_jax_params, opt_state, loss
-
-    # JIT compile the training step
-    train_step_jit = jax.jit(train_step)
 
     # Training Loop
     logger.info("Starting training loop...")
@@ -985,30 +1028,28 @@ def main():
     for epoch in range(int(training_args.num_train_epochs)):
         for batch in train_dataloader:
             step_start_time = time.time()
-
-            # Move batch to JAX device and unwrap to JAX arrays
+            
+            # Preprocess batch: cast to bf16 and shard
             new_batch = {}
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
-                    # Cast to bfloat16 if bf16 training is enabled and tensor is float
                     if training_args.bf16 and v.dtype == torch.float32:
                         v = v.to(torch.bfloat16)
-                    new_batch[k] = v.to('jax').jax()
+                    # Convert to JAX array (on CPU first)
+                    jax_arr = v.to('jax').jax()
+                    # Shard to TPU
+                    new_batch[k] = jax.device_put(jax_arr, get_sharding(jax_arr))
             batch = new_batch
             
             # Perform training step
-            # Note: params here are torchax tensors, which should be compatible with jax.jit if torchax handles it
-            # However, torch.func.functional_call expects a dict of params.
-            # And optimizer.update expects params to match the structure of grads.
-            
             jax_params, opt_state, loss = train_step_jit(jax_params, batch, opt_state)
             
             # Block until loss is computed to measure actual execution time (JAX is async)
             loss.block_until_ready()
-
+            
             step_end_time = time.time()
             step_duration = step_end_time - step_start_time
-
+            
             if global_step % training_args.logging_steps == 0:
                 logger.info(f"Epoch: {epoch}, Step: {global_step}, Loss: {loss}, Time: {step_duration:.4f}s")
             
@@ -1017,13 +1058,15 @@ def main():
             if training_args.save_steps > 0 and global_step % training_args.save_steps == 0:
                 save_path = os.path.join(training_args.output_dir, f"checkpoint-{global_step}.pt")
                 
-                # Wrap back to torchax tensors for saving
+                # Gather params to CPU for saving (to avoid OOM on single device gather)
+                params_cpu = jax.device_get(jax_params)
+                
+                # Wrap back to torchax tensors
                 env = torchax.default_env()
-                current_torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), jax_params)
+                current_torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), params_cpu)
                 
                 state = {
                     'params': current_torch_params,
-                    'opt_state': opt_state,
                     'epoch': epoch,
                     'global_step': global_step
                 }
@@ -1033,13 +1076,12 @@ def main():
     # Save final model
     final_save_path = os.path.join(training_args.output_dir, "final_checkpoint.pt")
     
-    # Wrap back to torchax tensors for saving
+    params_cpu = jax.device_get(jax_params)
     env = torchax.default_env()
-    final_torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), jax_params)
+    final_torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), params_cpu)
     
     state = {
         'params': final_torch_params,
-        'opt_state': opt_state,
         'epoch': training_args.num_train_epochs,
         'global_step': global_step
     }

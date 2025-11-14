@@ -162,32 +162,43 @@ class InternVLChatModel(PreTrainedModel):
         input_embeds = self.language_model.get_input_embeddings()(input_ids).clone()
 
         vit_embeds = self.extract_feature(pixel_values)
-        vit_embeds = vit_embeds[image_flags == 1]
+        # vit_embeds = vit_embeds[image_flags == 1]
         vit_batch_size = pixel_values.shape[0]
 
         B, N, C = input_embeds.shape
         input_embeds = input_embeds.reshape(B * N, C)
 
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-            print(f'dynamic ViT batch size: {vit_batch_size}, images per sample: {vit_batch_size / B}, dynamic token length: {N}')
-            if statistics is not None:
-                num_samples, num_padding_tokens, num_padding_images = statistics.tolist()
-                self.num_samples += num_samples
-                print(f'total_samples={self.num_samples}, {num_samples=}, {num_padding_tokens=}, {num_padding_images=}')
+        # if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+        #     print(f'dynamic ViT batch size: {vit_batch_size}, images per sample: {vit_batch_size / B}, dynamic token length: {N}')
+        #     if statistics is not None:
+        #         num_samples, num_padding_tokens, num_padding_images = statistics.tolist()
+        #         self.num_samples += num_samples
+        #         print(f'total_samples={self.num_samples}, {num_samples=}, {num_padding_tokens=}, {num_padding_images=}')
 
         input_ids = input_ids.reshape(B * N)
         selected = (input_ids == self.img_context_token_id)
-        try:
-            input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds.reshape(-1, C)
-            ignore_flag = False
-        except Exception as e:
-            vit_embeds = vit_embeds.reshape(-1, C)
-            print(f'warning: {e}, input_embeds[selected].shape={input_embeds[selected].shape}, '
-                  f'vit_embeds.shape={vit_embeds.shape}')
-            n_token = selected.sum()
-            input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds[:n_token]
-            ignore_flag = True
+        
+        # JAX-compatible scatter implementation
+        vit_embeds = vit_embeds.reshape(-1, C)
+        gather_indices = selected.long().cumsum(dim=0) - 1
+        # Clamp to avoid out of bounds, though masked out later
+        gather_indices = gather_indices.clamp(min=0, max=vit_embeds.shape[0] - 1)
+        gathered_vit = vit_embeds[gather_indices]
+        
+        mask = selected.unsqueeze(-1)
+        input_embeds = torch.where(mask, gathered_vit, input_embeds)
+        ignore_flag = False
 
+        # try:
+        #     input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds.reshape(-1, C)
+        #     ignore_flag = False
+        # except Exception as e:
+        #     vit_embeds = vit_embeds.reshape(-1, C)
+        #     print(f'warning: {e}, input_embeds[selected].shape={input_embeds[selected].shape}, '
+        #           f'vit_embeds.shape={vit_embeds.shape}')
+        #     n_token = selected.sum()
+        #     input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds[:n_token]
+        #     ignore_flag = True
         input_embeds = input_embeds.reshape(B, N, C)
 
         outputs = self.language_model(
@@ -220,8 +231,8 @@ class InternVLChatModel(PreTrainedModel):
             loss = loss_fct(shift_logits, shift_labels)
 
             shift_weights_sum = shift_weights.sum()
-            if loss_reduction_all_gather:
-                dist.all_reduce(shift_weights_sum, op=dist.ReduceOp.AVG)
+            # if loss_reduction_all_gather:
+            #     dist.all_reduce(shift_weights_sum, op=dist.ReduceOp.AVG)
 
             loss = loss * shift_weights
             loss = loss.sum() / shift_weights_sum

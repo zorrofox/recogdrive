@@ -73,10 +73,9 @@ class RotaryEmbedding(nn.Module):
             Tuple[torch.Tensor, torch.Tensor]: A tuple containing the cosine and
                 sine embeddings. Shape of each: (batch_size, 1, sequence_length, dim).
         """
-        seq_len = position_ids.max().item() + 1
-        if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=seq_len, device=x.device)
-
+        # Dynamic cache update removed for JAX compatibility.
+        # We assume max_position_embeddings (default 2048) is sufficient for training (seq_len=8).
+        
         cos = self.cos_cached.gather(
             2, position_ids.unsqueeze(1).unsqueeze(3).expand(-1, -1, -1, self.dim)
         )
@@ -104,5 +103,3 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
-
-

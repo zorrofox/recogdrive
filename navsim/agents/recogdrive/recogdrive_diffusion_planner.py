@@ -412,7 +412,7 @@ class ReCogDriveDiffusionPlanner(nn.Module):
              raise ValueError(f"p_mean_variance not supported for method: {self.config.sampling_method}")
 
         denoised_clip_value = getattr(self, 'denoised_clip_value', 1.0)
-        x_recon.clamp_(-denoised_clip_value, denoised_clip_value)
+        x_recon = x_recon.clamp(-denoised_clip_value, denoised_clip_value)
 
         if self.config.sampling_method == 'ddpm':
             model_mean = self.extract(self.ddpm_mu_coef1, t, x.shape) * x_recon + \
@@ -425,7 +425,7 @@ class ReCogDriveDiffusionPlanner(nn.Module):
 
             eps_clip_value = getattr(self, 'eps_clip_value', None)
             if eps_clip_value is not None:
-                pred_noise.clamp_(-eps_clip_value, eps_clip_value)
+                pred_noise = pred_noise.clamp(-eps_clip_value, eps_clip_value)
 
             if deterministic:
                 etas = torch.zeros((x.shape[0], 1, 1)).to(x.device)
@@ -434,8 +434,8 @@ class ReCogDriveDiffusionPlanner(nn.Module):
 
             sigma = (
                 etas
-                * ((1 - alpha_prev) / (1 - alpha_t) * (1 - alpha_t / alpha_prev)) ** 0.5
-            ).clamp_(min=1e-10)
+                * ((1 - alpha_prev) / (1 - alpha_t) * (1 - alpha_t / alpha_prev))
+            )**0.5
 
             pred_dir_xt = (1.0 - alpha_prev - sigma**2).clamp(min=0).sqrt() * pred_noise
             model_mean = (alpha_prev**0.5) * x_recon + pred_dir_xt
@@ -485,7 +485,7 @@ class ReCogDriveDiffusionPlanner(nn.Module):
             model_output = self.model(fused_input, vl_embeds, ego_status_features, t_discrete)
             pred_velocity = self.action_decoder(model_output)
             loss = F.mse_loss(pred_velocity, velocity_target, reduction='mean')
-        else: 
+        else:
             noise = torch.randn_like(gt_actions)
             t_discrete = self.sample_time(gt_actions.shape[0], device=gt_actions.device, dtype=gt_actions.dtype)
             
@@ -590,17 +590,17 @@ class ReCogDriveDiffusionPlanner(nn.Module):
                 std = std.to(dtype)
 
                 if t_int == 0:
-                    std.zero_()
+                    std = torch.zeros_like(std)
                 else:
                     std = torch.clamp(std, min=1e-3)
 
                 if hasattr(self, 'eval_randn_clip_value') and self.eval_randn_clip_value is not None:
-                    noise_sample.clamp_(-self.eval_randn_clip_value, self.eval_randn_clip_value)
+                    noise_sample = noise_sample.clamp(-self.eval_randn_clip_value, self.eval_randn_clip_value)
 
                 current_actions = mean + std * noise_sample
                 
                 if hasattr(self, 'final_action_clip_value') and self.final_action_clip_value is not None and i == len(timesteps_to_iterate) - 1:
-                    current_actions.clamp_(-self.final_action_clip_value, self.final_action_clip_value)
+                    current_actions = current_actions.clamp(-self.final_action_clip_value, self.final_action_clip_value)
 
         elif self.config.sampling_method == 'ddim':
             eval_min_sampling_denoising_std = getattr(self, 'eval_min_sampling_denoising_std', 0.0001)
@@ -620,11 +620,11 @@ class ReCogDriveDiffusionPlanner(nn.Module):
                 noise_sample = torch.randn_like(current_actions)
                 
                 if deterministic:
-                    std.zero_()
+                    std = torch.zeros_like(std)
                 else:
                     std = std.clamp(min=eval_min_sampling_denoising_std)
                 
-                noise_sample.clamp_(-eval_randn_clip_value, eval_randn_clip_value)
+                noise_sample = noise_sample.clamp(-eval_randn_clip_value, eval_randn_clip_value)
                 
                 current_actions = mean + std * noise_sample
         else:
@@ -632,7 +632,7 @@ class ReCogDriveDiffusionPlanner(nn.Module):
 
         final_action_clip_value = getattr(self, 'final_action_clip_value', 1.0)
         if final_action_clip_value is not None:
-            current_actions.clamp_(-final_action_clip_value, final_action_clip_value)
+            current_actions = current_actions.clamp(-final_action_clip_value, final_action_clip_value)
 
         final_actions = self.denorm_odo(current_actions)
 
@@ -707,7 +707,7 @@ class ReCogDriveDiffusionPlanner(nn.Module):
             if self.config.sampling_method == 'ddpm':
                 step_size = self.config.ddpm_cfg.num_train_timesteps // self.config.num_inference_steps
                 timesteps = list(reversed(range(0, self.config.ddpm_cfg.num_train_timesteps, step_size)))
-            else: 
+            else:
                 timesteps = self.ddim_t
             
             for i, t_int in enumerate(timesteps):
@@ -723,7 +723,7 @@ class ReCogDriveDiffusionPlanner(nn.Module):
 
                 if self.config.sampling_method == 'ddim':
                     if deterministic:
-                        std.zero_()
+                        std = torch.zeros_like(std)
                     else:
                         std = std.clamp(min=self.min_sampling_denoising_std)
                 else: # ddpm
@@ -735,12 +735,12 @@ class ReCogDriveDiffusionPlanner(nn.Module):
                         std = std.clamp(min=self.min_sampling_denoising_std)
                 
                 if hasattr(self, 'randn_clip_value') and self.randn_clip_value is not None:
-                    noise_sample = noise_sample.clamp_(-self.randn_clip_value, self.randn_clip_value)
+                    noise_sample = noise_sample.clamp(-self.randn_clip_value, self.randn_clip_value)
 
                 current_actions = mean + std * noise_sample
                 
                 if i == len(timesteps) - 1 and hasattr(self, 'final_action_clip_value') and self.final_action_clip_value is not None:
-                    current_actions = current_actions.clamp_(-self.final_action_clip_value, self.final_action_clip_value)
+                    current_actions = current_actions.clamp(-self.final_action_clip_value, self.final_action_clip_value)
                 
                 denoising_chain.append(current_actions.clone())
         else:

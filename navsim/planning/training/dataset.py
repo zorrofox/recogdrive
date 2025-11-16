@@ -107,7 +107,10 @@ class CacheOnlyDataset(torch.utils.data.Dataset):
                 found_caches: List[bool] = []
                 for builder in feature_builders + target_builders:
                     data_dict_path = token_path / (builder.get_unique_name() + ".gz")
-                    found_caches.append(data_dict_path.is_file())
+                    is_file = data_dict_path.is_file()
+                    if not is_file:
+                        print(f"Missing cache file: {data_dict_path}")
+                    found_caches.append(is_file)
                 if all(found_caches):
                     valid_cache_paths[token_path.name] = token_path
 

@@ -54,7 +54,7 @@ class FinalLayer(nn.Module):
             nn.Linear(hidden_size, 2 * hidden_size )
         )
 
-    @torch.compile
+    # Removed @torch.compile
     def modulate(self, x, shift, scale):
         if shift is None:
             return x * (1 + scale.unsqueeze(1))
@@ -110,7 +110,7 @@ class LightningDiTBlock(nn.Module):
                 nn.Linear(dim, 6 * dim, bias=True)
             )
 
-    @torch.compile
+    # Removed @torch.compile
     def modulate(self, x, shift, scale):
         if shift is None:
             return x * (1 + scale.unsqueeze(1))
@@ -256,6 +256,3 @@ class LightningDiT(nn.Module):
         output = self.final_layer(hidden_states, conditioning)
         
         return (output, all_hidden_states) if return_hidden_states else output
-
-
-

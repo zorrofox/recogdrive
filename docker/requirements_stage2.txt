@@ -1,0 +1,73 @@
+# Core
+numpy==1.26.4
+psutil
+tqdm
+pyyaml
+scipy
+
+# Torch (CPU) - Pinned versions
+torch==2.5.1
+torchvision==0.20.1
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Planning / NuPlan Core
+nuplan-devkit @ git+https://github.com/motional/nuplan-devkit/@nuplan-devkit-v1.2
+hydra-core>=1.3.2
+pandas
+geopandas>=0.12.1
+shapely>=2.0.0
+opencv-python-headless
+matplotlib
+tensorboard
+pytorch-lightning
+
+# NuPlan Additional Dependencies
+pyquaternion>=0.9.5
+aioboto3
+aiofiles
+control==0.9.1
+Fiona
+joblib
+nest_asyncio
+pyarrow
+pyinstrument
+pyogrio
+rasterio
+ray
+retry
+rtree
+selenium
+SQLAlchemy==1.4.27
+tornado
+ujson
+
+# Model / DL
+# Upgraded transformers to latest to resolve peft compatibility
+transformers>=4.46.0
+timm==0.9.12
+diffusers
+peft>=0.18.0
+accelerate
+
+# JAX Ecosystem
+optax
+flax
+chex
+
+# InternVL specific
+decord
+einops
+einops-exts
+sentencepiece
+tokenizers>=0.20.0
+imageio
+termcolor
+shortuuid
+pycocoevalcap
+yacs
+
+# Misc
+pytest
+bokeh==2.4.3
+notebook
+positional-encodings==6.0.1

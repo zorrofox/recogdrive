@@ -1,0 +1,29 @@
+FROM python:3.11
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    ffmpeg \
+    libsm6 \
+    libxext6 \
+    libgl1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /recogdrive
+
+# Copy unified requirements
+COPY requirements_unified.txt .
+
+# Install dependencies
+# 1. Upgrade pip
+# 2. Install unified requirements (Torch CPU, Hydra, Peft, etc.)
+# 3. Install JAX[TPU] - Locked to validated version 0.6.2
+# 4. Install Torchax - Locked to specific commit hash for stability
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements_unified.txt && \
+    pip install --no-cache-dir -U "jax[tpu]==0.6.2" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html && \
+    pip install --no-cache-dir git+https://github.com/google/torchax@56480747a6a99f103fe09ddaf1226571290a8223
+
+# Set environment variables for TPU
+ENV PJRT_DEVICE=TPU

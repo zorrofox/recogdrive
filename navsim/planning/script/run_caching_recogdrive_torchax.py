@@ -11,6 +11,7 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 import torch
 import numpy as np
+from tqdm import tqdm
 
 # Hack: Mock torch.jit.is_tracing to True to prevent transformers from executing 
 # data-dependent control flow (like checking if attention_mask is all 1s), 
@@ -55,6 +56,8 @@ def get_collate_fn(tokenizer, num_image_token=256, force_image_size=448):
         queries = []
         meta_data = []
         
+        missing_img_count = 0
+        
         for features, targets, token in batch:
             # 1. Decode Image Path
             image_path_tensor = features["image_path_tensor"]
@@ -66,16 +69,14 @@ def get_collate_fn(tokenizer, num_image_token=256, force_image_size=448):
             # 2. Load Image
             # For dummy run, if path is empty/dummy, generate zeros
             if not image_path or not os.path.exists(image_path):
-                # logger.warning(f"Image path not found: {image_path}, using dummy zeros.")
+                missing_img_count += 1
+                if missing_img_count <= 5: # Log first 5 missing images
+                    logger.warning(f"Image path not found: {image_path}, using dummy zeros.")
                 pv = torch.zeros((1, 3, force_image_size, force_image_size), dtype=torch.float32)
             else:
                 # Force static size for TPU batching
                 # We assume we disable dynamic_image_size for caching efficiency on TPU
                 pv = load_image(image_path, input_size=force_image_size, max_num=1).unsqueeze(0)
-            
-            # pv shape: (1, 3, 448, 448) -> squeeze -> (3, 448, 448) ? No, InternVL expects (N, C, H, W)
-            # load_image returns (N_patches, C, H, W). 
-            # If dynamic=False, max_num=1 -> (1, 3, 448, 448)
             
             pixel_values_list.append(pv) # Keep (1, 3, H, W)
             
@@ -150,9 +151,6 @@ def main(cfg: DictConfig) -> None:
     cfg.agent.cache_hidden_state = False
     
     logger.info("Building Agent and Backbone...")
-    # Instantiate agent to get builders
-    # We do NOT instantiate agent here to avoid importing diffusers/peft (Stage 2 deps) which conflict with Stage 1 env
-    # agent = instantiate(cfg.agent) 
     
     logger.info(f"Loading Backbone from {cfg.agent.vlm_path}...")
     
@@ -288,11 +286,14 @@ def main(cfg: DictConfig) -> None:
         if batch_size == 0: batch_size = num_devices
         logger.info(f"Adjusted batch size: {batch_size}")
 
+    # FORCE num_workers=0 and pin_memory=False for TPU compatibility
+    logger.info("Forcing num_workers=0 and pin_memory=False for TPU compatibility.")
     dataloader = DataLoader(
         dataset, 
         batch_size=batch_size, 
         shuffle=False, 
-        num_workers=cfg.dataloader.params.get("num_workers", 0),
+        num_workers=0, # CRITICAL FIX
+        pin_memory=False, # CRITICAL FIX
         collate_fn=get_collate_fn(tokenizer),
         drop_last=False 
     )
@@ -304,7 +305,8 @@ def main(cfg: DictConfig) -> None:
     total_time = 0
     count = 0
     
-    for batch_idx, (model_inputs, meta_data) in enumerate(dataloader):
+    # Use tqdm for progress tracking
+    for batch_idx, (model_inputs, meta_data) in enumerate(tqdm(dataloader, desc="Caching")):
         t0 = time.time()
         
         current_batch_size = model_inputs['input_ids'].shape[0]
@@ -320,9 +322,15 @@ def main(cfg: DictConfig) -> None:
             model_inputs
         )
         
+        if batch_idx == 0:
+            logger.info("Compiling JAX inference step... (This may take a few minutes)")
+        
         hidden_states = inference_step(jax_state, jax_inputs)
         hidden_states.block_until_ready()
         
+        if batch_idx == 0:
+            logger.info("Compilation finished.")
+
         hidden_states_cpu = jax.device_get(hidden_states)
         
         if pad_size > 0:

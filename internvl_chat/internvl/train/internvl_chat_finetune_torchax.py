@@ -890,7 +890,9 @@ def main():
         config.min_dynamic_patch = data_args.min_dynamic_patch
         config.max_dynamic_patch = data_args.max_dynamic_patch
         model = InternVLChatModel.from_pretrained(
-            model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config)
+            model_args.model_name_or_path,
+            torch_dtype=torch.bfloat16 if training_args.bf16 else torch.float32,
+            config=config)
     else:
         # ... (omitted for brevity, similar changes needed if this path is taken)
         raise NotImplementedError("Only loading from model_name_or_path is supported for this migration script for now.")
@@ -962,7 +964,9 @@ def main():
 
     # Optimizer
     learning_rate = training_args.learning_rate
-    optimizer = optax.adamw(learning_rate, weight_decay=training_args.weight_decay)
+    # AdamW epsilon for BF16 should be larger (standard 1e-8 is too small for bf16)
+    adam_eps = 1e-5 if training_args.bf16 else 1e-8
+    optimizer = optax.adamw(learning_rate, eps=adam_eps, weight_decay=training_args.weight_decay)
     
     # Get initial params as torchax tensors (on CPU)
     params = {k: v.detach() for k, v in model.named_parameters()}
@@ -1055,6 +1059,10 @@ def main():
             
             global_step += 1
             
+            if training_args.max_steps > 0 and global_step >= training_args.max_steps:
+                logger.info(f"Reached max_steps {training_args.max_steps}. Stopping training.")
+                break
+            
             if training_args.save_steps > 0 and global_step % training_args.save_steps == 0:
                 save_path = os.path.join(training_args.output_dir, f"checkpoint-{global_step}.pt")
                 
@@ -1072,6 +1080,9 @@ def main():
                 }
                 torchax.save_checkpoint(state, save_path, step=global_step)
                 logger.info(f"Saved checkpoint to {save_path}")
+        
+        if training_args.max_steps > 0 and global_step >= training_args.max_steps:
+            break
 
     # Save final model
     final_save_path = os.path.join(training_args.output_dir, "final_checkpoint.pt")

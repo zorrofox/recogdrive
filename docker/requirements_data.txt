@@ -1,0 +1,23 @@
+# Core
+numpy==1.26.4
+tqdm
+hydra-core==1.3.2
+omegaconf
+pytorch-lightning
+torch
+psutil
+
+# Nuplan / Navsim dependencies
+nuplan-devkit @ git+https://github.com/motional/nuplan-devkit/@nuplan-devkit-v1.2
+pandas
+geopandas>=0.12.1
+shapely>=2.0.0
+opencv-python-headless
+matplotlib
+pyquaternion>=0.9.5
+fiona
+joblib
+pyarrow
+rasterio
+rtree
+pytest

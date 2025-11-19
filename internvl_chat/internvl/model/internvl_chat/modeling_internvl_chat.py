@@ -222,7 +222,7 @@ class InternVLChatModel(PreTrainedModel):
             shift_weights = loss_weight[..., 1:].contiguous()
             # Flatten the tokens
             loss_fct = CrossEntropyLoss(reduction='none')
-            shift_logits = shift_logits.view(-1, self.language_model.config.vocab_size)
+            shift_logits = shift_logits.view(-1, self.language_model.config.vocab_size).float()
             shift_labels = shift_labels.view(-1)
             shift_weights = shift_weights.view(-1)
             # Enable model parallelism
@@ -235,7 +235,8 @@ class InternVLChatModel(PreTrainedModel):
             #     dist.all_reduce(shift_weights_sum, op=dist.ReduceOp.AVG)
 
             loss = loss * shift_weights
-            loss = loss.sum() / shift_weights_sum
+            # Add epsilon to avoid division by zero which causes NaN loss
+            loss = loss.sum() / (shift_weights_sum + 1e-6)
             if ignore_flag:
                 loss = loss * 0.0
         elif labels is not None:

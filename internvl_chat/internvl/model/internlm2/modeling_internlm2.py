@@ -404,24 +404,30 @@ class InternLM2Attention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f'Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is'
-                f' {attn_weights.size()}'
-            )
-
+        # Use optimized attention
+        # scaled_dot_product_attention handles scaling, softmax, and dropout
+        # Input shapes:
+        # query_states: (bsz, num_heads, q_len, head_dim)
+        # key_states: (bsz, num_heads, kv_seq_len, head_dim)
+        # value_states: (bsz, num_heads, kv_seq_len, head_dim)
+        # attention_mask: (bsz, 1, q_len, kv_seq_len) or None
+        
+        # Cast to FP32 for stability in attention calculation
+        query_states = query_states.to(torch.float32)
+        key_states = key_states.to(torch.float32)
+        value_states = value_states.to(torch.float32)
         if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f'Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}'
-                )
-            attn_weights = attn_weights + attention_mask
+            attention_mask = attention_mask.to(torch.float32)
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=attention_mask,
+            dropout_p=0.0, # Set dropout if needed, but usually 0.0 for inference/finetune
+            is_causal=False # Mask is provided explicitly if needed
+        )
+        attn_output = attn_output.to(torch.bfloat16)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(

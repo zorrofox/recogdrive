@@ -12,6 +12,8 @@ import sys
 import time
 import traceback
 import warnings
+import jax
+jax.config.update("jax_default_matmul_precision", "float32")
 from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import partial
@@ -919,6 +921,35 @@ def main():
     # Gradient checkpointing might need adjustment for torchax, but let's keep it for now
     if model_args.grad_checkpoint:
         model.language_model._set_gradient_checkpointing()
+        if hasattr(model.vision_model, 'encoder'):
+            model.vision_model.encoder.gradient_checkpointing = True
+
+    # Freezing logic
+    if model_args.freeze_backbone:
+        logger.info("Freezing ViT backbone...")
+        for param in model.vision_model.parameters():
+            param.requires_grad = False
+    if model_args.freeze_llm:
+        logger.info("Freezing LLM...")
+        for param in model.language_model.parameters():
+            param.requires_grad = False
+    if model_args.freeze_mlp:
+        logger.info("Freezing MLP...")
+        for param in model.mlp1.parameters():
+            param.requires_grad = False
+    if model_args.unfreeze_vit_layers > 0:
+        logger.info(f"Unfreezing last {model_args.unfreeze_vit_layers} ViT layers...")
+        # InternVisionModel has encoder.layers
+        layers = model.vision_model.encoder.layers
+        for i in range(len(layers) - model_args.unfreeze_vit_layers, len(layers)):
+            for param in layers[i].parameters():
+                param.requires_grad = True
+    if model_args.use_backbone_lora:
+        # LoRA parameters should already have requires_grad=True from peft
+        pass
+    if model_args.use_llm_lora:
+        # LoRA parameters should already have requires_grad=True from peft
+        pass
 
     # Move model to JAX device
     # logger.info("Moving model to JAX device...")
@@ -966,12 +997,41 @@ def main():
     learning_rate = training_args.learning_rate
     # AdamW epsilon for BF16 should be larger (standard 1e-8 is too small for bf16)
     adam_eps = 1e-5 if training_args.bf16 else 1e-8
-    optimizer = optax.adamw(learning_rate, eps=adam_eps, weight_decay=training_args.weight_decay)
+    
+    # Add gradient clipping and force FP32 optimizer state
+    # Note: optax.adamw might not support mu_dtype in older versions, so we check/fallback or just pass it if we are sure.
+    # But to be safe and precise, we use the explicit chain which is standard for mixed precision in JAX.
+    # Learning rate schedule with warmup
+    total_steps = training_args.max_steps if training_args.max_steps > 0 else (len(train_dataloader) * training_args.num_train_epochs)
+    warmup_steps = int(total_steps * training_args.warmup_ratio)
+    
+    schedule = optax.join_schedules(
+        schedules=[
+            optax.linear_schedule(init_value=0.0, end_value=learning_rate, transition_steps=warmup_steps),
+            optax.constant_schedule(value=learning_rate)
+        ],
+        boundaries=[warmup_steps]
+    )
+    
+    optimizer = optax.chain(
+        optax.clip(0.1), # Clip by value for better stability in BF16
+        optax.scale_by_adam(b1=0.9, b2=0.999, eps=adam_eps, mu_dtype=jnp.float32), # Force FP32 state
+        optax.add_decayed_weights(training_args.weight_decay),
+        optax.scale_by_schedule(schedule)
+    )
     
     # Get initial params as torchax tensors (on CPU)
-    params = {k: v.detach() for k, v in model.named_parameters()}
-    buffers = {k: v.detach() for k, v in model.named_buffers()}
-    params.update(buffers)
+    trainable_params = {}
+    static_params = {}
+    
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            trainable_params[name] = param.detach()
+        else:
+            static_params[name] = param.detach()
+    
+    for name, buffer in model.named_buffers():
+        static_params[name] = buffer.detach()
     
     # Convert to JAX params (on CPU)
     def torch_to_jax(tensor):
@@ -983,17 +1043,20 @@ def main():
             arr = arr.astype(jnp.bfloat16)
         return arr
 
-    jax_params_cpu = jax.tree_util.tree_map(torch_to_jax, params)
+    jax_trainable_params_cpu = jax.tree_util.tree_map(torch_to_jax, trainable_params)
+    jax_static_params_cpu = jax.tree_util.tree_map(torch_to_jax, static_params)
     
     # Move params to TPU with sharding
     logger.info("Sharding parameters to TPU...")
-    jax_params = to_sharded(jax_params_cpu)
+    jax_trainable_params = to_sharded(jax_trainable_params_cpu)
+    jax_static_params = to_sharded(jax_static_params_cpu)
     
     # Initialize optimizer state on TPU (sharded)
     # We need to define out_shardings for opt_state. 
     # Since opt_state structure matches params, we can use jax.eval_shape to infer structure and apply sharding.
-    
-    opt_state_shape = jax.eval_shape(optimizer.init, jax_params)
+    # Use FP32 params for initialization to ensure opt_state (mu, nu) is FP32, matching update path
+    jax_trainable_params_fp32_init = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), jax_trainable_params)
+    opt_state_shape = jax.eval_shape(optimizer.init, jax_trainable_params_fp32_init)
     opt_state_sharding = jax.tree_util.tree_map(get_sharding, opt_state_shape)
     
     @partial(jax.jit, out_shardings=opt_state_sharding)
@@ -1001,28 +1064,76 @@ def main():
         return optimizer.init(p)
         
     logger.info("Initializing optimizer state on TPU...")
-    opt_state = init_opt_state(jax_params)
+    opt_state = init_opt_state(jax_trainable_params_fp32_init)
 
     # Training Step Function
     # in_shardings: params (sharded), batch (sharded), opt_state (sharded)
     # out_shardings: params (sharded), opt_state (sharded), loss (replicated)
     
-    params_sharding = jax.tree_util.tree_map(get_sharding, jax_params)
+    trainable_params_sharding = jax.tree_util.tree_map(get_sharding, jax_trainable_params)
     
     @partial(jax.jit, 
-             out_shardings=(params_sharding, opt_state_sharding, NamedSharding(mesh, P())))
-    def train_step_jit(jax_params, batch, opt_state):
-        def loss_fn(params, batch):
+             out_shardings=(trainable_params_sharding, opt_state_sharding, NamedSharding(mesh, P())))
+    def train_step_jit(trainable_params, static_params, batch, opt_state):
+        # Keep trainable_params in BF16 for forward pass to match static_params and inputs
+        
+        def loss_fn(t_params, s_params, batch):
             env = torchax.default_env()
-            torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), params)
-            torch_batch = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), batch)
+            # Force FP32 for computation stability
+            t_params_fp32 = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), t_params)
+            s_params_fp32 = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), s_params)
+            # Cast batch to FP32 if it's BF16
+            batch_fp32 = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32) if hasattr(x, 'dtype') and x.dtype == jnp.bfloat16 else x, batch)
+            
+            # Combine trainable and static params
+            full_params = {}
+            full_params.update(t_params_fp32)
+            full_params.update(s_params_fp32)
+            
+            torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), full_params)
+            torch_batch = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), batch_fp32)
             outputs = torch.func.functional_call(model, torch_params, args=(), kwargs=torch_batch)
             return outputs.loss.jax()
 
-        loss, grads = jax.value_and_grad(loss_fn)(jax_params, batch)
-        updates, opt_state = optimizer.update(grads, opt_state, jax_params)
-        new_jax_params = optax.apply_updates(jax_params, updates)
-        return new_jax_params, opt_state, loss
+        loss, grads = jax.value_and_grad(loss_fn, argnums=0)(trainable_params, static_params, batch)
+        
+        # Check for NaN in gradients
+        all_grads_flat = jax.tree_util.tree_leaves(grads)
+        any_nan_grad = jnp.any(jnp.array([jnp.isnan(g).any() for g in all_grads_flat]))
+        
+        def skip_update_fn(grads, opt_state, params):
+            # To print parameter names, we need to iterate over the pytree.
+            # Since this is inside JIT, we use jax.debug.callback for each parameter.
+            
+            # We need the paths. jax.tree_util.tree_flatten_with_path gives us (path, value)
+            flat_grads_with_path, _ = jax.tree_util.tree_flatten_with_path(grads)
+            for path, grad in flat_grads_with_path:
+                # Path is a tuple of DictKey, IndexKey, etc. Convert to string.
+                path_str = "".join(str(p) for p in path)
+                has_nan = jnp.isnan(grad).any()
+                jax.debug.callback(lambda h, p: h and print(f"DEBUG: Gradient for {p} has NaN"), has_nan, path_str)
+            
+            return params, opt_state
+
+        def apply_update_fn(grads, opt_state, params):
+            # Cast to FP32 for stable update
+            grads_fp32 = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), grads)
+            params_fp32 = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), params)
+            
+            updates, opt_state = optimizer.update(grads_fp32, opt_state, params_fp32)
+            new_params_fp32 = optax.apply_updates(params_fp32, updates)
+            
+            # Cast back to BF16 for storage
+            new_params = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), new_params_fp32)
+            return new_params, opt_state
+
+        new_trainable_params, opt_state = jax.lax.cond(
+            any_nan_grad,
+            lambda g, os, p: skip_update_fn(g, os, p),
+            lambda g, os, p: apply_update_fn(g, os, p),
+            grads, opt_state, trainable_params
+        )
+        return new_trainable_params, opt_state, loss
 
     # Training Loop
     logger.info("Starting training loop...")
@@ -1037,6 +1148,21 @@ def main():
             new_batch = {}
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
+                    if torch.isnan(v).any():
+                        print(f"DEBUG: CPU input {k} has NaN!")
+                    
+                    # Pad to max_seq_length if needed to avoid JAX recompilation
+                    if k in ['input_ids', 'labels', 'attention_mask', 'position_ids'] and len(v.shape) == 2 and v.shape[1] < training_args.max_seq_length:
+                        pad_len = training_args.max_seq_length - v.shape[1]
+                        pad_val = 0
+                        if k == 'labels':
+                            pad_val = -100 # Standard ignore index for labels
+                        elif k == 'input_ids':
+                            pad_val = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+                        
+                        # Pad last dimension (dim 1)
+                        v = torch.nn.functional.pad(v, (0, pad_len), value=pad_val)
+                    
                     if training_args.bf16 and v.dtype == torch.float32:
                         v = v.to(torch.bfloat16)
                     # Convert to JAX array (on CPU first)
@@ -1046,7 +1172,7 @@ def main():
             batch = new_batch
             
             # Perform training step
-            jax_params, opt_state, loss = train_step_jit(jax_params, batch, opt_state)
+            jax_trainable_params, opt_state, loss = train_step_jit(jax_trainable_params, jax_static_params, batch, opt_state)
             
             # Block until loss is computed to measure actual execution time (JAX is async)
             loss.block_until_ready()
@@ -1067,14 +1193,17 @@ def main():
                 save_path = os.path.join(training_args.output_dir, f"checkpoint-{global_step}.pt")
                 
                 # Gather params to CPU for saving (to avoid OOM on single device gather)
-                params_cpu = jax.device_get(jax_params)
+                trainable_params_cpu = jax.device_get(jax_trainable_params)
+                static_params_cpu = jax.device_get(jax_static_params)
                 
                 # Wrap back to torchax tensors
                 env = torchax.default_env()
-                current_torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), params_cpu)
+                current_torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), trainable_params_cpu)
+                current_torch_static_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), static_params_cpu)
                 
                 state = {
                     'params': current_torch_params,
+                    'static_params': current_torch_static_params,
                     'epoch': epoch,
                     'global_step': global_step
                 }
@@ -1087,12 +1216,15 @@ def main():
     # Save final model
     final_save_path = os.path.join(training_args.output_dir, "final_checkpoint.pt")
     
-    params_cpu = jax.device_get(jax_params)
+    trainable_params_cpu = jax.device_get(jax_trainable_params)
+    static_params_cpu = jax.device_get(jax_static_params)
     env = torchax.default_env()
-    final_torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), params_cpu)
+    final_torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), trainable_params_cpu)
+    final_torch_static_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), static_params_cpu)
     
     state = {
         'params': final_torch_params,
+        'static_params': final_torch_static_params,
         'epoch': training_args.num_train_epochs,
         'global_step': global_step
     }

@@ -217,11 +217,27 @@ class InternAttention(nn.Module):
             q = self.q_norm(q.transpose(1, 2).flatten(-2, -1)).view(B_, N_, H_, D_).transpose(1, 2)
             k = self.k_norm(k.transpose(1, 2).flatten(-2, -1)).view(B_, N_, H_, D_).transpose(1, 2)
 
-        attn = ((q * self.scale) @ k.transpose(-2, -1))
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        # Use optimized attention
+        # scaled_dot_product_attention handles scaling, softmax, and dropout
+        # Input shapes:
+        # q: (B, num_heads, N, head_dim)
+        # k: (B, num_heads, N, head_dim)
+        # v: (B, num_heads, N, head_dim)
+        
+        # Cast to FP32 for stability in attention calculation
+        q = q.to(torch.float32)
+        k = k.to(torch.float32)
+        v = v.to(torch.float32)
+        
+        x = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None, # No mask needed for vision encoder usually
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+            is_causal=False
+        )
+        x = x.to(torch.bfloat16)
+        # x shape: (B, num_heads, N, head_dim)
+        x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -389,6 +405,10 @@ class InternVisionModel(PreTrainedModel):
 
     def get_input_embeddings(self):
         return self.embeddings
+
+    def _set_gradient_checkpointing(self, module, value=False):
+        if isinstance(module, InternVisionEncoder):
+            module.gradient_checkpointing = value
 
     def forward(
             self,

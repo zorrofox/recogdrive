@@ -183,6 +183,8 @@ class InternVLChatModel(PreTrainedModel):
         gather_indices = selected.long().cumsum(dim=0) - 1
         # Clamp to avoid out of bounds, though masked out later
         gather_indices = gather_indices.clamp(min=0, max=vit_embeds.shape[0] - 1)
+        # Cast ViT embeds to match LLM input dtype (BF16)
+        vit_embeds = vit_embeds.to(input_embeds.dtype)
         gathered_vit = vit_embeds[gather_indices]
         
         mask = selected.unsqueeze(-1)
@@ -244,12 +246,17 @@ class InternVLChatModel(PreTrainedModel):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.language_model.config.vocab_size)
+            loss_fct = CrossEntropyLoss(reduction='none')
+            shift_logits = shift_logits.view(-1, self.language_model.config.vocab_size).float()
             shift_labels = shift_labels.view(-1)
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
+            
+            # Manual mean reduction with epsilon to avoid NaN
+            non_ignored_mask = (shift_labels != loss_fct.ignore_index).float()
+            loss = (loss * non_ignored_mask).sum() / (non_ignored_mask.sum() + 1e-6)
+            
             if ignore_flag:
                 loss = loss * 0.0
 

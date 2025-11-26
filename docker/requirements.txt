@@ -57,7 +57,7 @@ scikit-learn>=1.2.2
 gradio==3.35.2
 gradio_client==0.2.9
 requests
-httpx==0.24.0
+# httpx==0.24.0
 uvicorn
 fastapi
 deepspeed==0.13.5
@@ -73,3 +73,7 @@ flax==0.8.4
 decord
 imageio
 datasets
+
+# Vertex AI requirements
+google-cloud-aiplatform==1.128.0
+gcsfs==2025.10.0

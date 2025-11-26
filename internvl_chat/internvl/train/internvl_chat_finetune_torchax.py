@@ -1014,12 +1014,12 @@ def main():
     total_steps = training_args.max_steps if training_args.max_steps > 0 else (len(train_dataloader) * training_args.num_train_epochs)
     warmup_steps = int(total_steps * training_args.warmup_ratio)
     
-    schedule = optax.join_schedules(
-        schedules=[
-            optax.linear_schedule(init_value=0.0, end_value=learning_rate, transition_steps=warmup_steps),
-            optax.constant_schedule(value=learning_rate)
-        ],
-        boundaries=[warmup_steps]
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=learning_rate,
+        warmup_steps=warmup_steps,
+        decay_steps=total_steps,
+        end_value=0.0
     )
     
     optimizer = optax.chain(

@@ -26,8 +26,10 @@ try:
 except:
     import json
 
+from datetime import datetime
 import torch
 import transformers
+from google.cloud import aiplatform
 from internvl.model.internlm2.modeling_internlm2 import InternLM2ForCausalLM
 from internvl.model.internvl_chat import (
     InternVisionConfig,
@@ -157,7 +159,7 @@ class ModelArguments:
     )
     unfreeze_lm_head: bool = field(
         default=False,
-        metadata={'help': 'Set to True to unfreeze the head of LLM. Default is False.'},
+        metadata={'help': 'Set to True to unfreeze the LM head. Default is False.'},
     )
     grad_checkpoint: bool = field(
         default=True,
@@ -225,6 +227,10 @@ class DataTrainingArguments:
     use_thumbnail: bool = field(
         default=False,
         metadata={'help': 'Set to True to add a thumbnail image. Default is False.'},
+    )
+    tensorboard_id: Optional[str] = field(
+        default=None,
+        metadata={'help': 'Vertex AI TensorBoard ID.'}
     )
     min_dynamic_patch: int = field(
         default=1,
@@ -833,8 +839,10 @@ def main():
 
     training_args.use_packed_ds = data_args.use_packed_ds
 
-    # Ensure output_dir is absolute path for orbax checkpointing
-    training_args.output_dir = os.path.abspath(training_args.output_dir)
+    # Ensure output_dir is absolute path for orbax checkpointing, but handle GCS paths
+    training_args.output_dir = training_args.output_dir.strip().strip('"').strip("'").strip()
+    if not training_args.output_dir.startswith('gs://'):
+        training_args.output_dir = os.path.abspath(training_args.output_dir)
 
     # Setup logging
     logging.basicConfig(
@@ -852,6 +860,7 @@ def main():
     enable_default_handler()
     enable_explicit_format()
 
+    logger.info(f"DEBUG: output_dir: '{training_args.output_dir}'")
     logger.info(f'Training/evaluation parameters {training_args}')
 
     # Set seed
@@ -1066,6 +1075,18 @@ def main():
     logger.info("Initializing optimizer state on TPU...")
     opt_state = init_opt_state(jax_trainable_params_fp32_init)
 
+    # Vertex AI TensorBoard
+    tb_run = None
+    if data_args.tensorboard_id:
+        logger.info(f"Initializing Vertex AI TensorBoard with ID: {data_args.tensorboard_id}")
+        try:
+            aiplatform.init(project='grhuang-02', location='us-east5', experiment='internvl-tpu', experiment_tensorboard=data_args.tensorboard_id)
+            aiplatform.start_run(f"run-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+            tb_run = True
+        except Exception as e:
+            logger.warning(f"Failed to initialize Vertex AI TensorBoard: {e}")
+            tb_run = None
+
     # Training Step Function
     # in_shardings: params (sharded), batch (sharded), opt_state (sharded)
     # out_shardings: params (sharded), opt_state (sharded), loss (replicated)
@@ -1093,7 +1114,21 @@ def main():
             torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), full_params)
             torch_batch = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), batch_fp32)
             outputs = torch.func.functional_call(model, torch_params, args=(), kwargs=torch_batch)
-            return outputs.loss.jax()
+            
+            loss = outputs.loss.jax()
+            # Mean Loss: sum of masked loss / sum of mask
+            loss_mask = (batch_fp32['labels'] != -100).astype(jnp.float32)
+            num_valid_tokens = jnp.sum(loss_mask) + 1e-8
+            
+            if loss.ndim == 0:
+                # If loss is already a scalar, it might be Sum Loss.
+                # To get Mean Loss, we divide by num_valid_tokens.
+                # If it was already Mean Loss, this will be incorrect, but given loss is ~300, it's likely Sum Loss.
+                loss = loss / num_valid_tokens
+            else:
+                # If loss is per-token, we take the mean over valid tokens.
+                loss = jnp.sum(loss * loss_mask) / num_valid_tokens
+            return loss
 
         loss, grads = jax.value_and_grad(loss_fn, argnums=0)(trainable_params, static_params, batch)
         
@@ -1140,96 +1175,113 @@ def main():
     model.train()
     
     global_step = 0
-    for epoch in range(int(training_args.num_train_epochs)):
-        for batch in train_dataloader:
-            step_start_time = time.time()
-            
-            # Preprocess batch: cast to bf16 and shard
-            new_batch = {}
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    if torch.isnan(v).any():
-                        print(f"DEBUG: CPU input {k} has NaN!")
-                    
-                    # Pad to max_seq_length if needed to avoid JAX recompilation
-                    if k in ['input_ids', 'labels', 'attention_mask', 'position_ids'] and len(v.shape) == 2 and v.shape[1] < training_args.max_seq_length:
-                        pad_len = training_args.max_seq_length - v.shape[1]
-                        pad_val = 0
-                        if k == 'labels':
-                            pad_val = -100 # Standard ignore index for labels
-                        elif k == 'input_ids':
-                            pad_val = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    epoch = 0  # Initialize epoch for use in finally block
+    try:
+        for epoch in range(int(training_args.num_train_epochs)):
+            for batch in train_dataloader:
+                step_start_time = time.time()
+                
+                # Preprocess batch: cast to bf16 and shard
+                new_batch = {}
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        if torch.isnan(v).any():
+                            print(f"DEBUG: CPU input {k} has NaN!")
                         
-                        # Pad last dimension (dim 1)
-                        v = torch.nn.functional.pad(v, (0, pad_len), value=pad_val)
+                        # Pad to max_seq_length if needed to avoid JAX recompilation
+                        if k in ['input_ids', 'labels', 'attention_mask', 'position_ids'] and len(v.shape) == 2 and v.shape[1] < data_args.max_seq_length:
+                            pad_len = data_args.max_seq_length - v.shape[1]
+                            pad_val = 0
+                            if k == 'labels':
+                                pad_val = -100 # Standard ignore index for labels
+                            elif k == 'input_ids':
+                                pad_val = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+                            
+                            # Pad last dimension (dim 1)
+                            v = torch.nn.functional.pad(v, (0, pad_len), value=pad_val)
+                        
+                        if training_args.bf16 and v.dtype == torch.float32:
+                            v = v.to(torch.bfloat16)
+                        # Convert to JAX array (on CPU first)
+                        jax_arr = v.to('jax').jax()
+                        # Shard to TPU
+                        new_batch[k] = jax.device_put(jax_arr, get_sharding(jax_arr))
+                batch = new_batch
+                
+                # Perform training step
+                jax_trainable_params, opt_state, loss = train_step_jit(jax_trainable_params, jax_static_params, batch, opt_state)
+                
+                # Block until loss is computed to measure actual execution time (JAX is async)
+                loss.block_until_ready()
+                
+                step_end_time = time.time()
+                step_duration = step_end_time - step_start_time
+                
+                if global_step % training_args.logging_steps == 0:
+                    logger.info(f"Epoch: {epoch}, Step: {global_step}, Loss: {loss}, Time: {step_duration:.4f}s")
+                    if tb_run:
+                        aiplatform.log_time_series_metrics({
+                            'train/loss': float(loss),
+                            'train/lr': float(schedule(global_step)),
+                            'train/step_time': step_duration
+                        }, step=global_step)
+                
+                global_step += 1
+                
+                if training_args.max_steps > 0 and global_step >= training_args.max_steps:
+                    logger.info(f"Reached max_steps {training_args.max_steps}. Stopping training.")
+                    break
+                
+                if training_args.save_steps > 0 and global_step % training_args.save_steps == 0:
+                    save_path = os.path.join(training_args.output_dir, f"checkpoint-{global_step}.pt")
                     
-                    if training_args.bf16 and v.dtype == torch.float32:
-                        v = v.to(torch.bfloat16)
-                    # Convert to JAX array (on CPU first)
-                    jax_arr = v.to('jax').jax()
-                    # Shard to TPU
-                    new_batch[k] = jax.device_put(jax_arr, get_sharding(jax_arr))
-            batch = new_batch
-            
-            # Perform training step
-            jax_trainable_params, opt_state, loss = train_step_jit(jax_trainable_params, jax_static_params, batch, opt_state)
-            
-            # Block until loss is computed to measure actual execution time (JAX is async)
-            loss.block_until_ready()
-            
-            step_end_time = time.time()
-            step_duration = step_end_time - step_start_time
-            
-            if global_step % training_args.logging_steps == 0:
-                logger.info(f"Epoch: {epoch}, Step: {global_step}, Loss: {loss}, Time: {step_duration:.4f}s")
-            
-            global_step += 1
+                    # Gather params to CPU for saving (to avoid OOM on single device gather)
+                    trainable_params_cpu = jax.device_get(jax_trainable_params)
+                    static_params_cpu = jax.device_get(jax_static_params)
+                    
+                    # Wrap back to torchax tensors
+                    env = torchax.default_env()
+                    current_torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), trainable_params_cpu)
+                    current_torch_static_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), static_params_cpu)
+                    
+                    state = {
+                        'params': current_torch_params,
+                        'static_params': current_torch_static_params,
+                        'epoch': epoch,
+                        'global_step': global_step
+                    }
+                    torchax.save_checkpoint(state, save_path, step=global_step)
+                    logger.info(f"Saved checkpoint to {save_path}")
             
             if training_args.max_steps > 0 and global_step >= training_args.max_steps:
-                logger.info(f"Reached max_steps {training_args.max_steps}. Stopping training.")
                 break
-            
-            if training_args.save_steps > 0 and global_step % training_args.save_steps == 0:
-                save_path = os.path.join(training_args.output_dir, f"checkpoint-{global_step}.pt")
-                
-                # Gather params to CPU for saving (to avoid OOM on single device gather)
-                trainable_params_cpu = jax.device_get(jax_trainable_params)
-                static_params_cpu = jax.device_get(jax_static_params)
-                
-                # Wrap back to torchax tensors
-                env = torchax.default_env()
-                current_torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), trainable_params_cpu)
-                current_torch_static_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), static_params_cpu)
-                
-                state = {
-                    'params': current_torch_params,
-                    'static_params': current_torch_static_params,
-                    'epoch': epoch,
-                    'global_step': global_step
-                }
-                torchax.save_checkpoint(state, save_path, step=global_step)
-                logger.info(f"Saved checkpoint to {save_path}")
+    except Exception as e:
+        logger.error(f"An error occurred during training: {e}")
+        raise
+    finally:
+        # Save final model
+        final_save_path = os.path.join(training_args.output_dir, "final_checkpoint.pt")
         
-        if training_args.max_steps > 0 and global_step >= training_args.max_steps:
-            break
+        trainable_params_cpu = jax.device_get(jax_trainable_params)
+        static_params_cpu = jax.device_get(jax_static_params)
+        env = torchax.default_env()
+        final_torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), trainable_params_cpu)
+        final_torch_static_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), static_params_cpu)
+        
+        state = {
+            'params': final_torch_params,
+            'static_params': final_torch_static_params,
+            'epoch': epoch,
+            'global_step': global_step
+        }
+        torchax.save_checkpoint(state, final_save_path, step=global_step)
+        logger.info(f"Saved final checkpoint to {final_save_path}")
 
-    # Save final model
-    final_save_path = os.path.join(training_args.output_dir, "final_checkpoint.pt")
-    
-    trainable_params_cpu = jax.device_get(jax_trainable_params)
-    static_params_cpu = jax.device_get(jax_static_params)
-    env = torchax.default_env()
-    final_torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), trainable_params_cpu)
-    final_torch_static_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), static_params_cpu)
-    
-    state = {
-        'params': final_torch_params,
-        'static_params': final_torch_static_params,
-        'epoch': training_args.num_train_epochs,
-        'global_step': global_step
-    }
-    torchax.save_checkpoint(state, final_save_path, step=global_step)
-    logger.info(f"Saved final checkpoint to {final_save_path}")
+        if tb_run:
+            try:
+                aiplatform.end_run()
+            except Exception as e:
+                logger.warning(f"Failed to end Vertex AI TensorBoard run: {e}")
 
 if __name__ == '__main__':
     main()

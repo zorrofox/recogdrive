@@ -1023,10 +1023,11 @@ def main():
     )
     
     optimizer = optax.chain(
-        optax.clip(0.1), # Clip by value for better stability in BF16
+        optax.clip_by_global_norm(1.0), # Standard clipping for InternVL
         optax.scale_by_adam(b1=0.9, b2=0.999, eps=adam_eps, mu_dtype=jnp.float32), # Force FP32 state
         optax.add_decayed_weights(training_args.weight_decay),
-        optax.scale_by_schedule(schedule)
+        optax.scale_by_schedule(schedule),
+        optax.scale(-1.0) # Important: Optax chains need negative scale for minimization
     )
     
     # Get initial params as torchax tensors (on CPU)
@@ -1093,45 +1094,75 @@ def main():
     
     trainable_params_sharding = jax.tree_util.tree_map(get_sharding, jax_trainable_params)
     
-    @partial(jax.jit, 
-             out_shardings=(trainable_params_sharding, opt_state_sharding, NamedSharding(mesh, P())))
-    def train_step_jit(trainable_params, static_params, batch, opt_state):
-        # Keep trainable_params in BF16 for forward pass to match static_params and inputs
+    def loss_fn(t_params, s_params, batch):
+        # Need to wrap back to torchax tensors for functional_call
+        # We are inside JIT, so we use the provided JAX arrays
         
-        def loss_fn(t_params, s_params, batch):
-            env = torchax.default_env()
-            # Force FP32 for computation stability
-            t_params_fp32 = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), t_params)
-            s_params_fp32 = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), s_params)
-            # Cast batch to FP32 if it's BF16
-            batch_fp32 = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32) if hasattr(x, 'dtype') and x.dtype == jnp.bfloat16 else x, batch)
-            
-            # Combine trainable and static params
-            full_params = {}
-            full_params.update(t_params_fp32)
-            full_params.update(s_params_fp32)
-            
-            torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), full_params)
-            torch_batch = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), batch_fp32)
-            outputs = torch.func.functional_call(model, torch_params, args=(), kwargs=torch_batch)
-            
-            loss = outputs.loss.jax()
-            # Mean Loss: sum of masked loss / sum of mask
-            loss_mask = (batch_fp32['labels'] != -100).astype(jnp.float32)
-            num_valid_tokens = jnp.sum(loss_mask) + 1e-8
-            
-            if loss.ndim == 0:
-                # If loss is already a scalar, it might be Sum Loss.
-                # To get Mean Loss, we divide by num_valid_tokens.
-                # If it was already Mean Loss, this will be incorrect, but given loss is ~300, it's likely Sum Loss.
-                loss = loss / num_valid_tokens
-            else:
-                # If loss is per-token, we take the mean over valid tokens.
-                loss = jnp.sum(loss * loss_mask) / num_valid_tokens
-            return loss
+        # Cast JAX arrays to torchax tensors
+        # Since we are in JAX JIT, we need to be careful. 
+        # Torchax allows wrapping JAX arrays.
+        
+        # We need to reconstruct the full params dictionary for functional_call
+        # t_params and s_params are JAX arrays
+        
+        # Optimization: keep env consistent
+        env = torchax.default_env()
+        
+        # Reconstruct full params
+        # Note: t_params and s_params are already JAX arrays
+        
+        # For torchax.tensor.Tensor, we need to provide the JAX array
+        
+        # To avoid overhead, we can try to use jax.tree_map to wrap all at once
+        # But functional_call expects a dict of tensors.
+        
+        # Prepare parameters for functional_call
+        # We need to merge t_params and s_params
+        # Both are dicts of JAX arrays
+        
+        # Create a unified dict of JAX arrays
+        # We can't easily merge dicts in JAX JIT without knowing keys, 
+        # but here we are in Python during JIT compilation, so it's fine.
+        
+        # Actually, loss_fn is called by jax.value_and_grad, which is JIT compiled.
+        # The arguments t_params, s_params are JAX arrays.
+        
+        # We need to know the keys to reconstruct the dictionary structure if needed, 
+        # but here t_params and s_params are already dictionaries of JAX arrays.
+        
+        t_params_fp32 = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), t_params)
+        s_params_fp32 = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), s_params)
+        batch_fp32 = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x, batch)
+        
+        full_params = {}
+        full_params.update(t_params_fp32)
+        full_params.update(s_params_fp32)
+        
+        torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), full_params)
+        torch_batch = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), batch_fp32)
+        outputs = torch.func.functional_call(model, torch_params, args=(), kwargs=torch_batch)
+        
+        loss = outputs.loss.jax()
+        # Mean Loss: sum of masked loss / sum of mask
+        loss_mask = (batch_fp32['labels'] != -100).astype(jnp.float32)
+        num_valid_tokens = jnp.sum(loss_mask) + 1e-8
+        
+        if loss.ndim == 0:
+            # If loss is already a scalar, it is likely already averaged by the model (standard for InternVL/Transformers)
+            # We do NOT divide again.
+            pass
+        else:
+            # If loss is per-token, we take the mean over valid tokens.
+            loss = jnp.sum(loss * loss_mask) / num_valid_tokens
+        return loss
 
+    @partial(jax.jit, out_shardings=(trainable_params_sharding, jax.sharding.NamedSharding(mesh, P())))
+    def compute_grad_jit(trainable_params, static_params, batch):
         loss, grads = jax.value_and_grad(loss_fn, argnums=0)(trainable_params, static_params, batch)
-        
+        return grads, loss
+
+    @partial(jax.jit, out_shardings=(trainable_params_sharding, opt_state_sharding))
+    def apply_updates_jit(grads, opt_state, trainable_params):
         # Check for NaN in gradients
         all_grads_flat = jax.tree_util.tree_leaves(grads)
         any_nan_grad = jnp.any(jnp.array([jnp.isnan(g).any() for g in all_grads_flat]))
@@ -1168,7 +1199,7 @@ def main():
             lambda g, os, p: apply_update_fn(g, os, p),
             grads, opt_state, trainable_params
         )
-        return new_trainable_params, opt_state, loss
+        return new_trainable_params, opt_state
 
     # Training Loop
     logger.info("Starting training loop...")
@@ -1176,10 +1207,14 @@ def main():
     
     global_step = 0
     epoch = 0  # Initialize epoch for use in finally block
+    accumulated_grads = None
+    accumulated_loss = 0.0
+    micro_step = 0
     try:
         for epoch in range(int(training_args.num_train_epochs)):
             for batch in train_dataloader:
-                step_start_time = time.time()
+                if micro_step % training_args.gradient_accumulation_steps == 0:
+                    step_start_time = time.time()
                 
                 # Preprocess batch: cast to bf16 and shard
                 new_batch = {}
@@ -1208,50 +1243,73 @@ def main():
                         new_batch[k] = jax.device_put(jax_arr, get_sharding(jax_arr))
                 batch = new_batch
                 
-                # Perform training step
-                jax_trainable_params, opt_state, loss = train_step_jit(jax_trainable_params, jax_static_params, batch, opt_state)
+                # Perform training step: compute gradient
+                grads, loss = compute_grad_jit(jax_trainable_params, jax_static_params, batch)
                 
-                # Block until loss is computed to measure actual execution time (JAX is async)
-                loss.block_until_ready()
+                # Accumulate gradients and loss
+                if accumulated_grads is None:
+                    accumulated_grads = grads
+                else:
+                    accumulated_grads = jax.tree_util.tree_map(lambda x, y: x + y, accumulated_grads, grads)
                 
-                step_end_time = time.time()
-                step_duration = step_end_time - step_start_time
+                accumulated_loss += loss
+                micro_step += 1
                 
-                if global_step % training_args.logging_steps == 0:
-                    logger.info(f"Epoch: {epoch}, Step: {global_step}, Loss: {loss}, Time: {step_duration:.4f}s")
-                    if tb_run:
-                        aiplatform.log_time_series_metrics({
-                            'train/loss': float(loss),
-                            'train/lr': float(schedule(global_step)),
-                            'train/step_time': step_duration
-                        }, step=global_step)
-                
-                global_step += 1
+                # Update parameters if accumulation steps reached
+                if micro_step % training_args.gradient_accumulation_steps == 0:
+                    # Average gradients and loss over accumulation steps
+                    accumulated_grads = jax.tree_util.tree_map(lambda x: x / training_args.gradient_accumulation_steps, accumulated_grads)
+                    current_loss = accumulated_loss / training_args.gradient_accumulation_steps
+                    
+                    # Apply updates
+                    jax_trainable_params, opt_state = apply_updates_jit(accumulated_grads, opt_state, jax_trainable_params)
+                    
+                    # Block until loss is computed to measure actual execution time (JAX is async)
+                    current_loss.block_until_ready()
+                    
+                    step_end_time = time.time()
+                    step_duration = step_end_time - step_start_time
+                    
+                    if global_step % training_args.logging_steps == 0:
+                        logger.info(f"Epoch: {epoch}, Step: {global_step}, Loss: {current_loss}, Time: {step_duration:.4f}s")
+                        if tb_run:
+                            aiplatform.log_time_series_metrics({
+                                'train/loss': float(current_loss),
+                                'train/lr': float(schedule(global_step)),
+                                'train/step_time': step_duration
+                            }, step=global_step)
+                    
+                    global_step += 1
+                    
+                    if training_args.save_steps > 0 and global_step % training_args.save_steps == 0:
+                        save_path = os.path.join(training_args.output_dir, f"checkpoint-{global_step}.pt")
+                        
+                        # Gather params to CPU for saving (to avoid OOM on single device gather)
+                        trainable_params_cpu = jax.device_get(jax_trainable_params)
+                        static_params_cpu = jax.device_get(jax_static_params)
+                        
+                        # Wrap back to torchax tensors
+                        env = torchax.default_env()
+                        current_torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), trainable_params_cpu)
+                        current_torch_static_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), static_params_cpu)
+                        
+                        state = {
+                            'params': current_torch_params,
+                            'static_params': current_torch_static_params,
+                            'epoch': epoch,
+                            'global_step': global_step
+                        }
+                        torchax.save_checkpoint(state, save_path, step=global_step)
+                        logger.info(f"Saved checkpoint to {save_path}")
+                    
+                    # Reset accumulation
+                    accumulated_grads = None
+                    accumulated_loss = 0.0
+                    step_start_time = time.time() # Reset timer for next step
                 
                 if training_args.max_steps > 0 and global_step >= training_args.max_steps:
                     logger.info(f"Reached max_steps {training_args.max_steps}. Stopping training.")
                     break
-                
-                if training_args.save_steps > 0 and global_step % training_args.save_steps == 0:
-                    save_path = os.path.join(training_args.output_dir, f"checkpoint-{global_step}.pt")
-                    
-                    # Gather params to CPU for saving (to avoid OOM on single device gather)
-                    trainable_params_cpu = jax.device_get(jax_trainable_params)
-                    static_params_cpu = jax.device_get(jax_static_params)
-                    
-                    # Wrap back to torchax tensors
-                    env = torchax.default_env()
-                    current_torch_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), trainable_params_cpu)
-                    current_torch_static_params = jax.tree_util.tree_map(lambda x: torchax_tensor.Tensor(x, env), static_params_cpu)
-                    
-                    state = {
-                        'params': current_torch_params,
-                        'static_params': current_torch_static_params,
-                        'epoch': epoch,
-                        'global_step': global_step
-                    }
-                    torchax.save_checkpoint(state, save_path, step=global_step)
-                    logger.info(f"Saved checkpoint to {save_path}")
             
             if training_args.max_steps > 0 and global_step >= training_args.max_steps:
                 break

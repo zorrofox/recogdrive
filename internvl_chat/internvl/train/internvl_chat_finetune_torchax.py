@@ -993,8 +993,22 @@ def main():
     # Sharding Spec: Shard the first dimension (0) of all arrays if divisible by num_devices
     # This acts as FSDP (sharding parameters) and Data Parallelism (sharding batch)
     def get_sharding(x):
-        if hasattr(x, 'shape') and len(x.shape) > 0 and x.shape[0] % num_devices == 0:
-            return NamedSharding(mesh, P('data'))
+        if hasattr(x, 'shape') and len(x.shape) > 0:
+            # Try to shard on the largest dimension if it's divisible, 
+            # or just the first dimension if divisible.
+            # For InternVL, major dimensions are usually divisible by 4, 8, 16 etc.
+            for ax in range(len(x.shape)):
+                if x.shape[ax] % num_devices == 0:
+                    # Found a divisible dimension, shard on it
+                    sharding_spec = [None] * len(x.shape)
+                    sharding_spec[ax] = 'data'
+                    return NamedSharding(mesh, P(*sharding_spec))
+            
+            # Fallback: if no dimension is perfectly divisible, we might have to replicate
+            # but we can try to shard anyway and let JAX handle padding if supported, 
+            # or just replicate. Given JAX constraints, replication is safest but memory-heavy.
+            # Optimization: could use GSPMD for automatic sharding, but that's complex to set up here.
+            return NamedSharding(mesh, P()) # Replicated
         else:
             return NamedSharding(mesh, P()) # Replicated
 
